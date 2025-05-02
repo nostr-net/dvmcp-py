@@ -1,6 +1,7 @@
 # DVMCP Python Bridge
+## **WARNING: this was 100% vibe coded**
 
-A Python implementation of the Distributed Virtual Machine Context Protocol (DVMCP) for Nostr.
+A Python implementation of [latest DVMCP spec](https://github.com/gzuuus/dvmcp/blob/master/docs/dvmcp-spec-2025-03-26.md). 
 
 ## Overview
 
