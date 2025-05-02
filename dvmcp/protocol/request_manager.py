@@ -97,13 +97,17 @@ class RequestManager:
         """
         request_event_id = response["request_event_id"]
         
-        logger.debug("Handling response", 
-                     request_event_id=request_event_id,
-                     success=response["success"])
+        logger.info("Handling response",
+                    request_event_id=request_event_id,
+                    success=response["success"],
+                    request_id=response.get("request_id"))
+        
+        # Log all pending requests for debugging
+        logger.info(f"Current pending requests: {list(self.pending_requests.keys())}")
         
         # Check if we have a pending request for this response
         if request_event_id not in self.pending_requests:
-            logger.warning("Received response for unknown request", 
+            logger.warning("Received response for unknown request",
                           request_event_id=request_event_id)
             return False
         

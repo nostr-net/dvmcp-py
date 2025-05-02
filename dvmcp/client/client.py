@@ -17,7 +17,7 @@ class DVMCPClient:
     """Main client for consuming MCP services via Nostr"""
     
     def __init__(
-        self, 
+        self,
         client_keys: 'Keys',
         client: Optional['Client'] = None,
         relays: Optional[List[str]] = None
@@ -31,17 +31,13 @@ class DVMCPClient:
             relays: List of relay URLs to connect to (if client not provided)
         """
         self.keys = client_keys
+        self.relays = relays or []
         
         # Initialize Nostr client if not provided
         if client:
             self.client = client
         else:
             self.client = Client(NostrSigner.keys(self.keys))
-            
-            # Add relays if provided
-            if relays:
-                for relay in relays:
-                    self.client.add_relay(relay)
         
         # Initialize request manager
         self.request_manager = RequestManager()
@@ -59,6 +55,11 @@ class DVMCPClient:
     
     async def connect(self) -> None:
         """Connect to relays"""
+        # Add relays if we have any
+        if hasattr(self, 'relays') and self.relays:
+            for relay in self.relays:
+                await self.client.add_relay(relay)
+        
         await self.client.connect()
         logger.info("Connected to relays")
     
@@ -285,6 +286,29 @@ class DVMCPClient:
         logger.info("Sent initialized notification", 
                    server_id=server_id)
     
+    # Notification handler wrapper class
+    class NotificationHandler:
+        def __init__(self, client):
+            self.client = client
+            
+        # Support both method names that might be called by the SDK
+        async def handle(self, *args) -> None:
+            await self._handle_notification_impl(args)
+            
+        async def handle_msg(self, *args) -> None:
+            await self._handle_notification_impl(args)
+            
+        async def _handle_notification_impl(self, args) -> None:
+            # Handle different argument patterns
+            if len(args) == 3:
+                relay_url, subscription_id, event = args
+                await self.client._handle_notification(relay_url, subscription_id, event)
+            elif len(args) == 2:
+                subscription_id, event = args
+                await self.client._handle_notification("", subscription_id, event)
+            else:
+                logger.warning(f"Unexpected arguments to notification handler: {args}")
+    
     async def _subscribe_to_responses(self) -> str:
         """
         Subscribe to response events
@@ -296,19 +320,24 @@ class DVMCPClient:
         
         # Create filter for responses (Event target = client's pubkey)
         response_filter = Filter().kind(Kind(26910)).pubkey(client_pubkey)
+        logger.info(f"Setting up response filter for pubkey: {client_pubkey}")
         
         # Create filter for notifications
         notification_filter = Filter().kind(Kind(21316)).pubkey(client_pubkey)
+        logger.info(f"Setting up notification filter for pubkey: {client_pubkey}")
         
         # Create subscription for handling both
         sub_id = str(uuid.uuid4())
+        logger.info(f"Creating subscription with ID: {sub_id}")
         await self.client.subscribe_with_id(
             id=sub_id,
             filter=[response_filter, notification_filter]
         )
+        logger.info(f"Subscription created successfully: {sub_id}")
         
-        # Setup handler
-        await self.client.handle_notifications(self._handle_notification)
+        # Setup handler using wrapper class
+        handler = self.NotificationHandler(self)
+        await self.client.handle_notifications(handler)
         
         logger.debug("Subscribed to responses and notifications", 
                     subscription_id=sub_id)
@@ -316,10 +345,10 @@ class DVMCPClient:
         return sub_id
     
     async def _handle_notification(
-        self, 
-        relay_url: str, 
-        subscription_id: str, 
-        event: 'Event'
+        self,
+        relay_url: str,
+        subscription_id: str,
+        message: Any
     ) -> None:
         """
         Handle incoming notifications and responses
@@ -327,22 +356,33 @@ class DVMCPClient:
         Args:
             relay_url: URL of the relay that sent the notification
             subscription_id: ID of the subscription
-            event: Nostr event
+            message: Nostr event or relay message
         """
         try:
-            kind = event.kind().as_u16()
-            
-            if kind == 26910:  # Response
-                response = DVMCPEventParser.parse_response(event)
-                await self.request_manager.handle_response(response)
-            elif kind == 21316:  # Notification
-                notification = DVMCPEventParser.parse_notification(event)
-                await self._handle_notification_event(notification)
+            # Check if this is a RelayMessage or an Event
+            if hasattr(message, 'kind') and callable(message.kind):
+                # This is an Event
+                kind = message.kind().as_u16()
+                logger.info(f"Received event with kind: {kind}, id: {message.id().to_hex()}")
+                
+                if kind == 26910:  # Response
+                    logger.info(f"Processing response event: {message.id().to_hex()}")
+                    response = DVMCPEventParser.parse_response(message)
+                    logger.info(f"Parsed response: request_id={response.get('request_id')}, request_event_id={response.get('request_event_id')}")
+                    await self.request_manager.handle_response(response)
+                elif kind == 21316:  # Notification
+                    logger.info(f"Processing notification event: {message.id().to_hex()}")
+                    notification = DVMCPEventParser.parse_notification(message)
+                    await self._handle_notification_event(notification)
+                else:
+                    logger.info(f"Received event with unhandled kind: {kind}")
+            else:
+                # This is a RelayMessage or something else
+                logger.info(f"Received message of type {type(message).__name__}: {message}")
             
         except Exception as e:
-            logger.error("Error handling event", 
-                         event_id=event.id().to_hex(), 
-                         error=str(e))
+            # Log error without trying to access event.id()
+            logger.error(f"Error handling message: {str(e)}")
     
     async def _handle_notification_event(self, notification: Dict[str, Any]) -> None:
         """

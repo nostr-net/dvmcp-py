@@ -16,7 +16,7 @@ class DVMCPProvider:
     """Main provider for exposing MCP services via Nostr"""
     
     def __init__(
-        self, 
+        self,
         provider_keys: 'Keys',
         client: Optional['Client'] = None,
         relays: Optional[List[str]] = None
@@ -30,17 +30,13 @@ class DVMCPProvider:
             relays: List of relay URLs to connect to (if client not provided)
         """
         self.keys = provider_keys
+        self.relays = relays or []
         
         # Initialize Nostr client if not provided
         if client:
             self.client = client
         else:
             self.client = Client(NostrSigner.keys(self.keys))
-            
-            # Add relays if provided
-            if relays:
-                for relay in relays:
-                    self.client.add_relay(relay)
         
         # State for announced servers
         self.announced_servers = {}
@@ -51,6 +47,11 @@ class DVMCPProvider:
     
     async def connect(self) -> None:
         """Connect to relays"""
+        # Add relays if we have any
+        if hasattr(self, 'relays') and self.relays:
+            for relay in self.relays:
+                await self.client.add_relay(relay)
+        
         await self.client.connect()
         logger.info("Connected to relays")
     
@@ -221,8 +222,31 @@ class DVMCPProvider:
         
         return event.id().to_hex()
     
+    # Notification handler wrapper class
+    class NotificationHandler:
+        def __init__(self, provider):
+            self.provider = provider
+            
+        # Support both method names that might be called by the SDK
+        async def handle(self, *args) -> None:
+            await self._handle_notification_impl(args)
+            
+        async def handle_msg(self, *args) -> None:
+            await self._handle_notification_impl(args)
+            
+        async def _handle_notification_impl(self, args) -> None:
+            # Handle different argument patterns
+            if len(args) == 3:
+                relay_url, subscription_id, event = args
+                await self.provider._handle_notification(relay_url, subscription_id, event)
+            elif len(args) == 2:
+                subscription_id, event = args
+                await self.provider._handle_notification("", subscription_id, event)
+            else:
+                logger.warning(f"Unexpected arguments to notification handler: {args}")
+    
     async def handle_requests(
-        self, 
+        self,
         server_id: str,
         callback: Callable[[Dict[str, Any]], Awaitable[Dict[str, Any]]]
     ) -> None:
@@ -260,18 +284,19 @@ class DVMCPProvider:
         await self.client.subscribe_with_id(id=provider_sub_id, filter=provider_filter)
         await self.client.subscribe_with_id(id=notification_sub_id, filter=notification_filter)
         
-        # Setup handler
-        await self.client.handle_notifications(self._handle_notification)
+        # Setup handler using wrapper class
+        handler = self.NotificationHandler(self)
+        await self.client.handle_notifications(handler)
         
         logger.info("Request handler set up", 
                    server_id=server_id,
                    subscriptions=[server_sub_id, provider_sub_id, notification_sub_id])
     
     async def _handle_notification(
-        self, 
-        relay_url: str, 
-        subscription_id: str, 
-        event: 'Event'
+        self,
+        relay_url: str,
+        subscription_id: str,
+        message: Any
     ) -> None:
         """
         Handle incoming requests and notifications
@@ -279,22 +304,27 @@ class DVMCPProvider:
         Args:
             relay_url: URL of the relay that sent the notification
             subscription_id: ID of the subscription
-            event: Nostr event
+            message: Nostr event or relay message
         """
         try:
-            kind = event.kind().as_u16()
-            
-            if kind == 25910:  # Request
-                request = DVMCPEventParser.parse_request(event)
-                await self._handle_request_event(request)
-            elif kind == 21316:  # Notification
-                notification = DVMCPEventParser.parse_notification(event)
-                await self._handle_notification_event(notification)
+            # Check if this is a RelayMessage or an Event
+            if hasattr(message, 'kind') and callable(message.kind):
+                # This is an Event
+                kind = message.kind().as_u16()
+                
+                if kind == 25910:  # Request
+                    request = DVMCPEventParser.parse_request(message)
+                    await self._handle_request_event(request)
+                elif kind == 21316:  # Notification
+                    notification = DVMCPEventParser.parse_notification(message)
+                    await self._handle_notification_event(notification)
+            else:
+                # This is a RelayMessage or something else
+                logger.debug(f"Received message of type {type(message).__name__}: {message}")
             
         except Exception as e:
-            logger.error("Error handling event", 
-                         event_id=event.id().to_hex(), 
-                         error=str(e))
+            # Log error without trying to access event.id()
+            logger.error(f"Error handling message: {str(e)}")
     
     async def _handle_request_event(self, request: Dict[str, Any]) -> None:
         """
@@ -451,11 +481,30 @@ class DVMCPProvider:
             # Client disconnect notification
             logger.info("Client disconnected",
                        client_pubkey=notification.get("sender_pubkey"))
+        elif notification_type == "notifications/initialized":
+            # Client initialized notification
+            logger.info("Client initialized",
+                       client_pubkey=notification.get("sender_pubkey"),
+                       server_id=server_id)
         else:
             # Forward notification to appropriate handler if available
             if server_id and server_id in self.request_handlers:
                 try:
-                    await self.request_handlers[server_id](notification)
+                    # Check if the handler expects a request with a method
+                    if hasattr(self.request_handlers[server_id], "__code__") and "method" in self.request_handlers[server_id].__code__.co_varnames:
+                        # Create a request-like object with a method field
+                        request = {
+                            "method": f"notification/{notification_type}",
+                            "params": notification.get("params", {}),
+                            "server_id": server_id,
+                            "client_pubkey": notification.get("sender_pubkey"),
+                            "event_id": notification.get("event_id"),
+                            "request_id": notification.get("id", "notification")
+                        }
+                        await self.request_handlers[server_id](request)
+                    else:
+                        # Pass the notification directly
+                        await self.request_handlers[server_id](notification)
                 except Exception as e:
                     logger.error("Error handling notification",
                                 notification_type=notification_type,
@@ -487,9 +536,15 @@ class DVMCPProvider:
         Returns:
             Event ID of the response
         """
-        logger.debug("Sending response",
-                    request_id=request_event.get("request_id"),
-                    request_event_id=request_event.get("event_id"))
+        client_pubkey = request_event.get("client_pubkey", "unknown")
+        request_id = request_event.get("request_id", "unknown")
+        request_event_id = request_event.get("event_id", "unknown")
+        
+        logger.info("Preparing to send response",
+                   client_pubkey=client_pubkey,
+                   request_id=request_id,
+                   request_event_id=request_event_id,
+                   method=request_event.get("method"))
         
         # Create response event
         event = DVMCPEventBuilder.create_response(
@@ -499,12 +554,18 @@ class DVMCPProvider:
             request_id=request_event["request_id"]
         )
         
+        response_event_id = event.id().to_hex()
+        logger.info(f"Created response event: {response_event_id}")
+        
         # Send event to relays
+        logger.info(f"Sending response event to relays: {response_event_id}")
         await self.client.send_event(event)
         
         logger.info("Response sent",
-                   request_id=request_event.get("request_id"),
-                   response_event_id=event.id().to_hex())
+                   client_pubkey=client_pubkey,
+                   request_id=request_id,
+                   request_event_id=request_event_id,
+                   response_event_id=response_event_id)
         
         return event.id().to_hex()
     
