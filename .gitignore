@@ -19,3 +19,5 @@ __pycache__
 *.coverage
 *.cover
 *.hypothesis/
+
+.planning/debug/
